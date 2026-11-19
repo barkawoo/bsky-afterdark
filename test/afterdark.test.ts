@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { makeMockAgent } from './helpers/mockAgent'
 
 const db = vi.hoisted(() => ({ getLatestPostsForTag: undefined as any }))
@@ -9,6 +9,8 @@ vi.mock('../src/db/dbClient', async () => {
 })
 
 import { handler, shortname } from '../src/algos/afterdark'
+import { followsCache } from '../src/addn/followsCache'
+import { likesCache } from '../src/addn/likesCache'
 
 const ctx: any = {}
 const page = (dids: string[], cursor?: string) => ({
@@ -20,6 +22,8 @@ const likesPage = (dids: string[], cursor?: string) => ({
 
 describe('afterdark handler (characterization)', () => {
   beforeEach(() => {
+    followsCache.clear()
+    likesCache.clear()
     db.getLatestPostsForTag.mockReset().mockResolvedValue([])
     vi.spyOn(console, 'log').mockImplementation(() => {})
   })
@@ -103,5 +107,85 @@ describe('afterdark handler (characterization)', () => {
     db.getLatestPostsForTag.mockResolvedValue([])
     const empty = await handler(ctx, { feed: 'f', limit: 30 } as any, agent, 'did:me')
     expect(empty.cursor).toBeUndefined()
+  })
+
+  describe('caching', () => {
+    beforeEach(() => vi.useFakeTimers())
+    afterEach(() => vi.useRealTimers())
+    const p: any = { feed: 'f', limit: 30 }
+
+    it('follows cache hit avoids API calls and keeps authors identical', async () => {
+      const agent: any = makeMockAgent()
+      agent.api.app.bsky.graph.getFollows.mockResolvedValue(page(['did:a']))
+      await handler(ctx, p, agent, 'did:me')
+      await handler(ctx, p, agent, 'did:me')
+      expect(agent.api.app.bsky.graph.getFollows).toHaveBeenCalledTimes(1)
+      expect(db.getLatestPostsForTag.mock.calls[1][0].authors).toEqual(['did:me', 'did:a'])
+    })
+
+    it('follows cache is per DID and expires after TTL', async () => {
+      const agent: any = makeMockAgent()
+      await handler(ctx, p, agent, 'did:me')
+      await handler(ctx, p, agent, 'did:you')
+      expect(agent.api.app.bsky.graph.getFollows).toHaveBeenCalledTimes(2)
+      vi.advanceTimersByTime(10 * 60 * 1000 + 1)
+      await handler(ctx, p, agent, 'did:me')
+      expect(agent.api.app.bsky.graph.getFollows).toHaveBeenCalledTimes(3)
+    })
+
+    it('failed follows fetch is not cached', async () => {
+      const agent: any = makeMockAgent()
+      agent.api.app.bsky.graph.getFollows.mockRejectedValueOnce(new Error('boom'))
+      await handler(ctx, p, agent, 'did:me')
+      await handler(ctx, p, agent, 'did:me')
+      expect(agent.api.app.bsky.graph.getFollows).toHaveBeenCalledTimes(2)
+    })
+
+    it('concurrent requests share one in-flight follows fetch', async () => {
+      const agent: any = makeMockAgent()
+      let release!: (v: any) => void
+      agent.api.app.bsky.graph.getFollows.mockReturnValue(new Promise((r) => (release = r)))
+      const a = handler(ctx, p, agent, 'did:me')
+      const b = handler(ctx, p, agent, 'did:me')
+      await Promise.resolve()
+      release(page(['did:a']))
+      await Promise.all([a, b])
+      expect(agent.api.app.bsky.graph.getFollows).toHaveBeenCalledTimes(1)
+    })
+
+    it('likes cache hit avoids API calls, expires after TTL, dedupes in flight', async () => {
+      const agent: any = makeMockAgent()
+      await handler(ctx, p, agent, 'did:me')
+      await handler(ctx, p, agent, 'did:me')
+      expect(agent.api.app.bsky.feed.getLikes).toHaveBeenCalledTimes(1)
+      vi.advanceTimersByTime(61_000)
+      await handler(ctx, p, agent, 'did:me')
+      expect(agent.api.app.bsky.feed.getLikes).toHaveBeenCalledTimes(2)
+
+      likesCache.clear()
+      let release!: (v: any) => void
+      agent.api.app.bsky.feed.getLikes.mockReset().mockReturnValue(new Promise((r) => (release = r)))
+      const a = handler(ctx, p, agent, 'did:me')
+      const b = handler(ctx, p, agent, 'did:you')
+      await Promise.resolve()
+      await Promise.resolve()
+      release(likesPage([]))
+      await Promise.all([a, b])
+      expect(agent.api.app.bsky.feed.getLikes).toHaveBeenCalledTimes(1)
+    })
+
+    it('likes pagination cursor is per post (not carried between pinned posts)', async () => {
+      const { getAllLikers } = await import('../src/addn/likesCache')
+      const agent: any = makeMockAgent()
+      agent.api.app.bsky.feed.getLikes
+        .mockResolvedValueOnce(likesPage(['did:1'], 'cur1'))
+        .mockResolvedValueOnce(likesPage(['did:2']))
+        .mockResolvedValueOnce(likesPage(['did:3']))
+      await getAllLikers(agent, 'at://post/1')
+      const second = await getAllLikers(agent, 'at://post/2')
+      const calls = agent.api.app.bsky.feed.getLikes.mock.calls
+      expect(calls[2][0]).toEqual({ uri: 'at://post/2', limit: 100 })
+      expect([...second]).toEqual(['did:3'])
+    })
   })
 })

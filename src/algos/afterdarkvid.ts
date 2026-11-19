@@ -6,6 +6,7 @@ import { Post } from '../db/schema'
 import dbClient from '../db/dbClient'
 import { Database } from '../db'
 import { BskyAgent } from '@atproto/api'
+import { getAllFollows } from '../addn/followsCache'
 
 dotenv.config()
 
@@ -17,7 +18,6 @@ export const handler = async (ctx: AppContext, params: QueryParams, agent: BskyA
   // console.log(requesterDID, " is requesting the after dark feed")
 
   let authors: any[] = [];
-  let req_cursor: string | null = null;
 
   if (requesterDID) {
 
@@ -25,32 +25,12 @@ export const handler = async (ctx: AppContext, params: QueryParams, agent: BskyA
 
       authors.push(requesterDID)
 
-      // following lists are paginated, run in a loop until we've fetched all follows
+      // cached per-DID (TTL), paginates through all follows on a miss
+      authors.push(...(await getAllFollows(agent, requesterDID)))
 
-      // console.log("Fetching followers...")
-      // console.time(`followFetch-${requesterDID}`)
-
-      while (true) {
-
-        const res = await agent.api.app.bsky.graph.getFollows({
-          actor: requesterDID,
-          limit: 100, // default 50, max 100
-          ... (req_cursor !== null ? { ['cursor']: req_cursor } : {})
-        })
-
-        const follows = res.data.follows.map((profile) => {
-          return profile.did
-        })
-        authors.push(...follows)
-        if (res.data.cursor) {
-          req_cursor = res.data.cursor
-        } else {
-          break
-        }
-      }
-      // console.timeEnd(`followFetch-${requesterDID}`)
-
-    } catch (error) {
+    } catch (error: any) {
+      // partial follows (if any) are used but not cached
+      if (Array.isArray(error?.partialFollows)) authors.push(...error.partialFollows)
       console.log("ERROR:::", error)
     }
 
