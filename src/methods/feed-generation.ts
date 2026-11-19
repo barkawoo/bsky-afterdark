@@ -7,8 +7,14 @@ import { AtUri } from '@atproto/syntax'
 import { OutputSchema as AlgoOutput } from '../lexicon/types/app/bsky/feed/getFeedSkeleton'
 // import { request } from 'http'
 import { BskyAgent, ComAtprotoServerResetPassword } from '@atproto/api'
+import { TtlCache, envInt } from '../addn/ttlCache'
 
-const algoCache = new Map<string, { date: number; output: AlgoOutput | undefined }>()
+// Short response cache. Feeds are personalized per requester, so the key
+// includes requesterDid (plus feed, cursor and limit).
+export const algoCache = new TtlCache<AlgoOutput>(
+  envInt('FEED_CACHE_TTL_SECONDS', 30) * 1000,
+  envInt('FEED_CACHE_MAX_ENTRIES', 2000),
+)
 
 export default function (server: Server, ctx: AppContext, agent: BskyAgent) {
   server.app.bsky.feed.getFeedSkeleton(async ({ params, req, res }) => {
@@ -55,24 +61,13 @@ export default function (server: Server, ctx: AppContext, agent: BskyAgent) {
     // console.log("Request from: ", requesterDid, " with authorization: ", authorization)
     // console.log(requesterDid, " requested a feed")
 
-    let body: AlgoOutput | undefined = undefined
+    const cacheKey = JSON.stringify([params.feed, requesterDid, params.cursor ?? null, params.limit])
 
-    // const cacheKey = JSON.stringify(params)
-
-    // if (algoCache.has(cacheKey)) {
-    //   const cached = algoCache.get(cacheKey)!
-    //   if (cached.date > Date.now() - 1000 * cacheAge.valueOf()) {
-    //     body = cached.output
-    //   } else {
-    //     algoCache.delete(cacheKey)
-    //   }
-    // }
-
-    if (body === undefined) {
-      body = await algo(ctx, params, agent, requesterDid)
-      // algoCache.set(cacheKey, { date: Date.now(), output: body })
-    }
-    if (body.feed.length < params.limit) body.cursor = undefined
+    const body = await algoCache.getOrFetch(cacheKey, async () => {
+      const out = await algo(ctx, params, agent, requesterDid)
+      if (out.feed.length < params.limit) out.cursor = undefined
+      return out
+    })
 
     return {
       encoding: 'application/json',
