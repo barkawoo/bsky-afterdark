@@ -62,18 +62,7 @@ describe('getLatestPostsForTag query shape', () => {
 
   it('mediaOnly', async () => {
     await dbClient.getLatestPostsForTag({ tag: 't', mediaOnly: true })
-    expect(lastQuery()).toEqual({
-      algoTags: 't',
-      $and: [
-        {
-          $or: [
-            { 'embed.images': { $ne: null } },
-            { 'embed.video': { $ne: null } },
-            { 'embed.media': { $ne: null } },
-          ],
-        },
-      ],
-    })
+    expect(lastQuery()).toEqual({ algoTags: 't', $and: [{ hasMedia: true }] })
   })
 
   it('nsfwOnly / excludeNSFW / authors', async () => {
@@ -119,11 +108,8 @@ describe('getUnlabelledPostsWithMedia query shape', () => {
   it('uses media filter, empty labels, lag', async () => {
     await dbClient.getUnlabelledPostsWithMedia(10, 1000)
     const q = lastQuery()
-    expect(q.$or).toEqual([
-      { 'embed.images': { $ne: null } },
-      { 'embed.video': { $ne: null } },
-      { 'embed.media': { $ne: null } },
-    ])
+    expect(q.hasMedia).toBe(true)
+    expect(q.$or).toBeUndefined()
     expect(q.labels).toEqual([])
     expect(q.indexedAt.$lt).toBeTypeOf('number')
     expect(lastSort()).toEqual({ indexedAt: -1, cid: -1 })
@@ -131,19 +117,48 @@ describe('getUnlabelledPostsWithMedia query shape', () => {
 })
 
 describe('init index set', () => {
-  it('creates the expected indexes', async () => {
+  it('backfills, creates indexes, drops obsolete ones', async () => {
     h.collection.createIndex.mockClear()
+    h.collection.dropIndex.mockClear()
+    h.collection.updateMany.mockClear()
     await dbClient.init()
-    const specs = h.collection.createIndex.mock.calls.map((c) => c[0])
-    expect(specs).toEqual([
+    const calls = h.collection.createIndex.mock.calls
+    expect(calls.map((c) => c[0])).toEqual([
       { uri: 1 },
       { indexedAt: -1, cid: -1 },
-      { algoTags: 1 },
+      { algoTags: 1, earliestCreatedIndexedAt: -1, createdAt: -1, indexedAt: -1, cid: -1 },
       { author: 1 },
       { labels: 1 },
-      { 'embed.images': 1 },
-      { 'embed.video': 1 },
-      { 'embed.media': 1 },
+      { indexedAt: -1, cid: -1 },
     ])
+    expect(calls[5][1]).toEqual({
+      name: 'media_indexedAt_cid',
+      partialFilterExpression: { hasMedia: true },
+    })
+    expect(h.collection.dropIndex.mock.calls.map((c) => c[0])).toEqual([
+      'embed.images_1', 'embed.video_1', 'embed.media_1', 'algoTags_1',
+    ])
+    // backfill happens before any index creation
+    expect(h.collection.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+      h.collection.createIndex.mock.invocationCallOrder[0],
+    )
+  })
+
+  it('backfill is a pipeline update scoped to docs lacking hasMedia', async () => {
+    h.collection.updateMany.mockClear()
+    await dbClient.init()
+    const [filter, pipeline] = h.collection.updateMany.mock.calls[0]
+    expect(filter).toEqual({ hasMedia: { $exists: false } })
+    expect(Array.isArray(pipeline)).toBe(true)
+    const or = pipeline[0].$set.hasMedia.$or
+    expect(or).toHaveLength(3)
+    expect(JSON.stringify(or)).toContain('$embed.images')
+    expect(JSON.stringify(or)).toContain('$embed.video')
+    expect(JSON.stringify(or)).toContain('$embed.media')
+  })
+
+  it('tolerates dropIndex failures', async () => {
+    h.collection.dropIndex.mockRejectedValue(new Error('index not found'))
+    await expect(dbClient.init()).resolves.toBeUndefined()
   })
 })

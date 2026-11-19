@@ -37,14 +37,64 @@ class dbSingleton {
 
     const postCollection = this.client.db().collection('post')
 
+    // Backfill hasMedia on pre-existing docs BEFORE queries rely on it.
+    await this.backfillHasMedia(postCollection)
+
     await postCollection.createIndex({ uri: 1 });
+    // Serves removeTagFromOldPosts (indexedAt range) and getTaggedPostsBetween.
     await postCollection.createIndex({ indexedAt: -1, cid: -1 });
-    await postCollection.createIndex({ algoTags: 1 });
+    // Matches the feed query: equality on algoTags, then the feed sort.
+    // Its prefix also covers plain { algoTags } lookups (old algoTags_1 dropped).
+    await postCollection.createIndex({
+      algoTags: 1,
+      earliestCreatedIndexedAt: -1,
+      createdAt: -1,
+      indexedAt: -1,
+      cid: -1,
+    });
     await postCollection.createIndex({ author: 1 });
     await postCollection.createIndex({ labels: 1 });
-    await postCollection.createIndex({ "embed.images": 1 });
-    await postCollection.createIndex({ "embed.video": 1 });
-    await postCollection.createIndex({ "embed.media": 1 });
+    // Small partial index for getUnlabelledPostsWithMedia (only media docs).
+    await postCollection.createIndex(
+      { indexedAt: -1, cid: -1 },
+      { name: 'media_indexedAt_cid', partialFilterExpression: { hasMedia: true } },
+    );
+
+    // Obsolete indexes: multikey over large embed arrays (replaced by hasMedia)
+    // and algoTags_1 (prefix of the compound feed index).
+    for (const name of [
+      'embed.images_1',
+      'embed.video_1',
+      'embed.media_1',
+      'algoTags_1',
+    ]) {
+      try {
+        await postCollection.dropIndex(name)
+      } catch (err) {
+        // index already absent
+      }
+    }
+  }
+
+  // One-time, idempotent: only touches docs that lack hasMedia. Semantics match
+  // the old query ({ 'embed.x': { $ne: null } }).
+  async backfillHasMedia(postCollection: any) {
+    const present = (f: string) => ({
+      $ne: [{ $ifNull: [f, null] }, null],
+    })
+    await postCollection.updateMany({ hasMedia: { $exists: false } }, [
+      {
+        $set: {
+          hasMedia: {
+            $or: [
+              present('$embed.images'),
+              present('$embed.video'),
+              present('$embed.media'),
+            ],
+          },
+        },
+      },
+    ])
   }
 
   async deleteManyURI(collection: string, uris: string[]) {
@@ -223,13 +273,7 @@ class dbSingleton {
     const conditions: any[] = []
 
     if (mediaOnly) {
-      conditions.push({
-        $or: [
-          { 'embed.images': { $ne: null } },
-          { 'embed.video': { $ne: null } },
-          { 'embed.media': { $ne: null } },
-        ],
-      })
+      conditions.push({ hasMedia: true })
     }
     if (nsfwOnly) {
       conditions.push({
@@ -305,11 +349,7 @@ class dbSingleton {
       ?.db()
       .collection('post')
       .find({
-        $or: [
-          { 'embed.images': { $ne: null } },
-          { 'embed.video': { $ne: null } },
-          { 'embed.media': { $ne: null } },
-        ],
+        hasMedia: true,
         labels: [],
         indexedAt: { $lt: new Date().getTime() - lagTime },
       })
