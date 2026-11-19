@@ -154,7 +154,8 @@ describe('dbClient write characterization', () => {
     })
 
     it('splits quota 2/3 fresh, 1/3 scheduled', async () => {
-      cursor.toArray.mockResolvedValueOnce(Array.from({ length: 10 }, (_, i) => ({ uri: 's' + i })))
+      const rows = (n: number, p: string) => Array.from({ length: n }, (_, i) => ({ uri: p + i }))
+      cursor.toArray.mockResolvedValueOnce(rows(10, 's')).mockResolvedValueOnce(rows(20, 'f'))
       await dbClient.getUnlabelledPostsWithMedia(30)
       expect(lim()).toEqual([10, 20]) // scheduled first (quota), then fresh gets the rest
     })
