@@ -21,6 +21,8 @@ export type Post = {
   labelsCheckedAt?: number
   // number of successful label fetches (drives the re-check backoff)
   labelsCheckCount?: number
+  // times the post was absent from a successful getPosts response (capped)
+  labelsMissCount?: number
 }
 
 export type SubState = {

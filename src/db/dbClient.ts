@@ -334,32 +334,51 @@ class dbSingleton {
     else return results
   }
 
-  // Re-check schedule: after the Nth successful label fetch (labelsCheckCount=N)
-  // a post is due again once labelsCheckedAt is older than RECHECK_DELAYS[N-1]
-  // (the last delay repeats). Labels can land arbitrarily late and feed
-  // filters (excludeNSFW / nsfwOnly) depend on them, so we keep re-checking
-  // until the post is older than the longest feed retention (56 days for
-  // mutuals-ad-vid; env LABEL_RECHECK_RETENTION_DAYS). Posts lacking the
-  // fields (legacy docs, or never successfully fetched) count as unchecked.
-  // Index use: the planner can use the indexedAt index for the range; the
-  // count/checkedAt branches are residual filters over the candidates.
+  // Two classes of candidate, both media posts with labels: [] inside the
+  // [now - retention, now - lagTime] window (retention 56 days = longest feed,
+  // mutuals-ad-vid; env LABEL_RECHECK_RETENTION_DAYS):
+  //  - fresh: never attempted (labelsCheckedAt absent; includes legacy docs).
+  //  - scheduled: attempted before and due again by backoff.
+  //      * found posts: after the Nth successful fetch (labelsCheckCount=N)
+  //        due when labelsCheckedAt < now - RECHECK_DELAYS[N-1] (last repeats).
+  //        Labels can land arbitrarily late and feed filters (excludeNSFW /
+  //        nsfwOnly) depend on them, so this continues until retention.
+  //      * missed posts (absent from a successful getPosts response: deleted,
+  //        takedown): labels untouched; labelsMissCount=K, due on the same
+  //        delay schedule, and dropped for good at K >= LABEL_MAX_MISSES (5).
+  //        Found posts also stop once misses reach the cap.
+  // Starvation guard: of `limit`, ~2/3 is reserved for fresh posts and the
+  // rest for scheduled ones; whichever class is short spills its unused quota
+  // to the other. Index use: indexedAt index serves the range/sort; the
+  // count/checkedAt/miss predicates are residual filters.
   static readonly RECHECK_DELAYS = [
     60 * 60 * 1000,
     6 * 60 * 60 * 1000,
     24 * 60 * 60 * 1000,
   ]
+  static readonly FRESH_QUOTA = 2 / 3
 
   async getUnlabelledPostsWithMedia(
     limit = 100,
     lagTime = 5 * 60 * 1000,
     retentionMs = (Number(process.env.LABEL_RECHECK_RETENTION_DAYS) || 56) *
       24 * 60 * 60 * 1000,
+    maxMisses = Number(process.env.LABEL_MAX_MISSES) || 5,
   ) {
     const now = new Date().getTime()
     const delays = dbSingleton.RECHECK_DELAYS
-    const due: Filter<Document>[] = [
-      { labelsCheckCount: { $exists: false } },
-      { labelsCheckedAt: { $exists: false } },
+    const delayFor = (n: number) => delays[Math.min(n, delays.length) - 1]
+    const base = {
+      $or: [
+        { 'embed.images': { $ne: null } },
+        { 'embed.video': { $ne: null } },
+        { 'embed.media': { $ne: null } },
+      ],
+      labels: [],
+      indexedAt: { $lt: now - lagTime, $gt: now - retentionMs },
+    }
+    const fresh: Filter<Document> = { labelsCheckedAt: { $exists: false } }
+    const foundDue: Filter<Document>[] = [
       ...delays.map((d, i) => ({
         labelsCheckCount: i + 1,
         labelsCheckedAt: { $lt: now - d },
@@ -369,27 +388,44 @@ class dbSingleton {
         labelsCheckedAt: { $lt: now - delays[delays.length - 1] },
       },
     ]
-    const results = this.client
-      ?.db()
-      .collection('post')
-      .find({
-        $or: [
-          { 'embed.images': { $ne: null } },
-          { 'embed.video': { $ne: null } },
-          { 'embed.media': { $ne: null } },
-        ],
-        labels: [],
-        indexedAt: { $lt: now - lagTime, $gt: now - retentionMs },
-        $and: [{ $or: due }],
+    const missDue: Filter<Document>[] = []
+    for (let k = 1; k < maxMisses; k++) {
+      missDue.push({
+        labelsCheckCount: { $exists: false },
+        labelsMissCount: k,
+        labelsCheckedAt: { $lt: now - delayFor(k) },
       })
-      .sort({ indexedAt: -1, cid: -1 })
-      .limit(limit)
-      .toArray()
+    }
+    const scheduled: Filter<Document> = {
+      labelsMissCount: { $not: { $gte: maxMisses } },
+      $or: [...foundDue, ...missDue],
+    }
 
-    return results || []
+    const coll = this.client?.db().collection('post')
+    const run = async (extra: Filter<Document>, n: number, skip = 0) => {
+      if (n <= 0 || !coll) return []
+      let c = coll
+        .find({ ...base, ...extra })
+        .sort({ indexedAt: -1, cid: -1 })
+      if (skip > 0) c = c.skip(skip)
+      return (await c.limit(n).toArray()) || []
+    }
+
+    const freshQ = Math.ceil(limit * dbSingleton.FRESH_QUOTA)
+    const schedQ = limit - freshQ
+    const sched = await run(scheduled, schedQ)
+    const freshRes = await run(fresh, limit - sched.length)
+    const out = [...sched, ...freshRes]
+    // scheduled had more than its quota and fresh left room: spill the other way
+    if (out.length < limit && sched.length === schedQ) {
+      out.push(...(await run(scheduled, limit - out.length, schedQ)))
+    }
+    return out
   }
 
-  async updateLabelsForURIs(postEntries: { uri: string; labels: string[] }[]) {
+  async updateLabelsForURIs(
+    postEntries: { uri: string; labels?: string[]; missing?: boolean }[],
+  ) {
     // bulkWrite throws on an empty ops array
     if (!postEntries || postEntries.length === 0) return
     const checkedAt = new Date().getTime()
@@ -401,10 +437,20 @@ class dbSingleton {
           postEntries.map((e) => ({
             updateOne: {
               filter: { uri: { $eq: e.uri } },
-              update: {
-                $set: { labels: e.labels, labelsCheckedAt: checkedAt },
-                $inc: { labelsCheckCount: 1 },
-              },
+              // missing: absent from a successful response; labels untouched
+              update: e.missing
+                ? {
+                    $set: { labelsCheckedAt: checkedAt },
+                    $inc: { labelsMissCount: 1 },
+                  }
+                : {
+                    $set: {
+                      labels: e.labels,
+                      labelsCheckedAt: checkedAt,
+                      labelsMissCount: 0,
+                    },
+                    $inc: { labelsCheckCount: 1 },
+                  },
             },
           })),
           { ordered: false },

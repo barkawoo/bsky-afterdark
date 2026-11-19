@@ -18,7 +18,7 @@ export default async function batchUpdate(agent, interval) {
 
     const chunkSize = 25
 
-    const postEntries: { uri: string; labels: string[] }[] = []
+    const postEntries: { uri: string; labels?: string[]; missing?: boolean }[] = []
 
     for (let i = 0; i < unlabelledPosts.length; i += chunkSize) {
       const chunk = unlabelledPosts.slice(i, i + chunkSize).flatMap((item) => {
@@ -36,8 +36,13 @@ export default async function batchUpdate(agent, interval) {
 
       const posts = res.data.posts
 
-      // URIs missing from the response (or an empty response) are NOT
-      // recorded: they stay unchecked and keep their existing labels.
+      // URIs absent from a successful response are recorded as misses
+      // (labels untouched, backed off and capped in dbClient). A thrown
+      // fetch above is not a miss and simply retries next cycle.
+      const returned = new Set(posts.map((p) => p.uri))
+      chunk.forEach((uri) => {
+        if (!returned.has(uri)) postEntries.push({ uri, missing: true })
+      })
 
       for (let k = 0; k < posts.length; k++) {
         const labels: string[] = []
