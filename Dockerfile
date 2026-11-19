@@ -1,22 +1,21 @@
-FROM node:20 as build
+FROM node:20-slim AS build
 WORKDIR /app
-COPY ./package.json .
-COPY ./yarn.lock .
-RUN yarn install
+COPY ./package.json ./yarn.lock ./
+RUN yarn install --frozen-lockfile
 COPY . .
 RUN yarn build
 
-FROM node:20 AS deps
+FROM node:20-slim AS deps
 WORKDIR /app
-COPY --from=build /app/package.json .
-COPY --from=build /app/yarn.lock .
-RUN yarn install --production
+COPY ./package.json ./yarn.lock ./
+RUN yarn install --frozen-lockfile --production && yarn cache clean
 
-FROM node:20
+FROM node:20-slim
+ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=build /app/dist ./dist
-COPY --from=deps /app/package.json .
-COPY --from=deps /app/yarn.lock .
+COPY --from=deps /app/package.json /app/yarn.lock ./
 COPY --from=deps /app/node_modules ./node_modules
+USER node
 EXPOSE 3000
-CMD ["yarn","start"]
+CMD ["node", "./dist/index.js"]

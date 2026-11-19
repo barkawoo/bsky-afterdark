@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.github
+.devcontainer
+.vscode
+images
+test
+test.txt
+*.md
+.env
+.env.*
+!.env.example
+Dockerfile
+.dockerignore
