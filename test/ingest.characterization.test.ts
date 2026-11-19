@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import crypto from 'crypto'
 import { collection, resetCollection } from './helpers/mockMongo'
 
@@ -61,6 +61,7 @@ describe('dbClient write characterization', () => {
     expect(ops[1].updateOne.update.$set.labels).toEqual([])
     // empty-label results are still marked checked
     expect(typeof ops[1].updateOne.update.$set.labelsCheckedAt).toBe('number')
+    expect(ops[1].updateOne.update.$inc).toEqual({ labelsCheckCount: 1 })
   })
 
   it('updateLabelsForURIs skips bulkWrite for empty input', async () => {
@@ -99,21 +100,39 @@ describe('dbClient write characterization', () => {
     await expect(dbClient.replaceManyURI('post', [{ _id: 'a', uri: 'u' }])).rejects.toThrow('bulk')
   })
 
-  it('getUnlabelledPostsWithMedia queries media posts with labels: [] older than lag, unchecked or due a recheck', async () => {
-    cursor.toArray.mockResolvedValue([{ uri: 'a' }])
-    const res = await dbClient.getUnlabelledPostsWithMedia(300, 1000, 5000)
-    const q = collection.find.mock.calls[0][0]
-    expect(q.labels).toEqual([])
-    expect(q.$or).toHaveLength(3)
-    expect(q.indexedAt.$lt).toBeLessThanOrEqual(Date.now() - 1000 + 5)
-    const alts = q.$and[0].$or
-    expect(alts).toContainEqual({ labelsCheckedAt: { $exists: false } })
-    expect(alts).toContainEqual({ labelsCheckedAt: null })
-    expect(alts).toContainEqual({
-      $expr: { $lt: ['$labelsCheckedAt', { $add: ['$indexedAt', 5000] }] },
+  describe('getUnlabelledPostsWithMedia backoff', () => {
+    const H = 3600 * 1000
+    const NOW = 1_800_000_000_000
+    beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(NOW) })
+    afterEach(() => { vi.useRealTimers() })
+
+    it('queries media posts with labels: [] inside lag/retention window', async () => {
+      cursor.toArray.mockResolvedValue([{ uri: 'a' }])
+      const res = await dbClient.getUnlabelledPostsWithMedia(300, 1000, 5000)
+      const q = collection.find.mock.calls[0][0]
+      expect(q.labels).toEqual([])
+      expect(q.$or).toHaveLength(3)
+      expect(q.indexedAt).toEqual({ $lt: NOW - 1000, $gt: NOW - 5000 })
+      expect(cursor.limit).toHaveBeenCalledWith(300)
+      expect(res).toEqual([{ uri: 'a' }])
     })
-    expect(cursor.limit).toHaveBeenCalledWith(300)
-    expect(res).toEqual([{ uri: 'a' }])
+
+    it('defaults retention to 56 days', async () => {
+      await dbClient.getUnlabelledPostsWithMedia()
+      expect(collection.find.mock.calls[0][0].indexedAt.$gt).toBe(NOW - 56 * 24 * H)
+    })
+
+    it('encodes the 1h/6h/24h/24h-repeat schedule with exact boundaries', async () => {
+      await dbClient.getUnlabelledPostsWithMedia(10, 1000, 1e15)
+      const due = collection.find.mock.calls[0][0].$and[0].$or
+      expect(due).toContainEqual({ labelsCheckCount: { $exists: false } })
+      expect(due).toContainEqual({ labelsCheckedAt: { $exists: false } })
+      expect(due).toContainEqual({ labelsCheckCount: 1, labelsCheckedAt: { $lt: NOW - 1 * H } })
+      expect(due).toContainEqual({ labelsCheckCount: 2, labelsCheckedAt: { $lt: NOW - 6 * H } })
+      expect(due).toContainEqual({ labelsCheckCount: 3, labelsCheckedAt: { $lt: NOW - 24 * H } })
+      expect(due).toContainEqual({ labelsCheckCount: { $gt: 3 }, labelsCheckedAt: { $lt: NOW - 24 * H } })
+      expect(due).toHaveLength(6)
+    })
   })
 })
 
@@ -177,10 +196,9 @@ describe('batchUpdate characterization', () => {
     await expect(batchUpdate(agent, 1)).rejects.toBe(stop)
   }
 
-  it('chunks uris by 25 and records labels, including empty results', async () => {
+  it('chunks uris by 25 and records only returned posts (incl. empty labels)', async () => {
     const uris = Array.from({ length: 60 }, (_, i) => `at://p${i}`)
     const getPosts = vi.fn(async ({ uris }: any) => {
-      // first chunk: only return first post (with labels), second: empty, third: all unlabeled
       const n = getPosts.mock.calls.length
       if (n === 1) return { data: { posts: [{ uri: uris[0], labels: [{ val: 'porn' }] }] } }
       if (n === 2) return { data: { posts: [] } }
@@ -189,9 +207,12 @@ describe('batchUpdate characterization', () => {
     await run(uris, getPosts)
     expect(getPosts.mock.calls.map((c) => c[0].uris.length)).toEqual([25, 25, 10])
     const entries = mockDb.updateLabelsForURIs.mock.calls[0][0]
+    // chunk 1: only p0 returned; chunk 2 empty response: nothing recorded; chunk 3: all 10
     expect(entries[0]).toEqual({ uri: 'at://p0', labels: ['porn'] })
-    expect(entries.slice(1, 26).every((e: any) => e.labels.length === 0)).toBe(true)
-    expect(entries).toHaveLength(1 + 25 + 10)
+    expect(entries).toHaveLength(1 + 10)
+    expect(entries.slice(1).every((e: any) => e.labels.length === 0)).toBe(true)
+    expect(entries.map((e: any) => e.uri)).not.toContain('at://p1')
+    expect(entries.map((e: any) => e.uri)).not.toContain('at://p25')
   })
 
   it('awaits updateLabelsForURIs', async () => {
