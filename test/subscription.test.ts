@@ -37,13 +37,19 @@ describe('handleEvent post document', () => {
       labels: [],
       tags: [],
     })
+    expect(doc.hasMedia).toBe(true)
     expect(doc._id).toHaveLength(24)
     expect(doc.earliestCreatedIndexedAt).toBeTypeOf('number')
+  })
+
+  it.each([[{ video: {} }], [{ media: { images: [] } }]])('video/media embed %j', async (e) => {
+    expect((await stored(e)).hasMedia).toBe(true)
   })
 
   it('non-media post', async () => {
     const doc = await stored(undefined)
     expect(doc.embed).toBeUndefined()
+    expect(doc.hasMedia).toBe(false)
     expect(doc.algoTags).toEqual(['a'])
   })
 })

@@ -67,6 +67,11 @@ export class FirehoseSubscription extends FirehoseSubscriptionBase {
       createdAt: new Date(create.record?.createdAt).getTime(),
       algoTags: null,
       embed: create.record?.embed,
+      hasMedia: !!(
+        create.record?.embed?.images ||
+        create.record?.embed?.video ||
+        create.record?.embed?.media
+      ),
       tags: Array.isArray(create.record?.tags) ? create.record?.tags : [],
       labels: create.record?.labels ? create.record?.labels.values.map((label) => {
         return label.val

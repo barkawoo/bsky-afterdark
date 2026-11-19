@@ -15,6 +15,7 @@ export type Post = {
   indexedAt: number
   algoTags: string[] | null
   embed?: any | null
+  hasMedia?: boolean
   tags?: string[] | null
 }
 
