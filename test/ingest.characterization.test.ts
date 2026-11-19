@@ -130,7 +130,7 @@ describe('dbClient write characterization', () => {
 
     it('found-post schedule 1h/6h/24h/24h-repeat with exact boundaries', async () => {
       await dbClient.getUnlabelledPostsWithMedia(30, 1000, 1e15)
-      const sched = queries().find((q) => q.labelsMissCount)
+      const sched = queries().find((q) => q.$or?.some?.((x: any) => x.labelsCheckCount === 1))
       const or = sched.$or
       expect(or).toContainEqual({ labelsCheckCount: 1, labelsCheckedAt: { $lt: NOW - 1 * H } })
       expect(or).toContainEqual({ labelsCheckCount: 2, labelsCheckedAt: { $lt: NOW - 6 * H } })
@@ -138,19 +138,24 @@ describe('dbClient write characterization', () => {
       expect(or).toContainEqual({ labelsCheckCount: { $gt: 3 }, labelsCheckedAt: { $lt: NOW - 24 * H } })
     })
 
-    it('miss schedule 1h/6h/24h/24h, capped at maxMisses (cap excluded)', async () => {
-      await dbClient.getUnlabelledPostsWithMedia(30, 1000, 1e15, 5)
-      const sched = queries().find((q) => q.labelsMissCount)
-      expect(sched.labelsMissCount).toEqual({ $not: { $gte: 5 } })
-      const miss = (k: number, d: number) => ({
+    it('miss schedule 1h/6h/24h then plateaus at 24h; no permanent exclusion', async () => {
+      await dbClient.getUnlabelledPostsWithMedia(30, 1000, 1e15)
+      const sched = queries().find((q) => q.$or?.some?.((x: any) => x.labelsCheckCount === 1))
+      expect(sched).not.toHaveProperty('labelsMissCount')
+      const miss = (k: any, d: number) => ({
         labelsCheckCount: { $exists: false }, labelsMissCount: k, labelsCheckedAt: { $lt: NOW - d * H },
       })
       const or = sched.$or
       expect(or).toContainEqual(miss(1, 1))
       expect(or).toContainEqual(miss(2, 6))
       expect(or).toContainEqual(miss(3, 24))
-      expect(or).toContainEqual(miss(4, 24))
-      expect(or.filter((x: any) => x.labelsMissCount !== undefined)).toHaveLength(4) // no k=5 branch
+      // any number of misses beyond 3 is still due after 24h
+      expect(or).toContainEqual(miss({ $gt: 3 }, 24))
+    })
+
+    it('misses still respect the retention bound', async () => {
+      await dbClient.getUnlabelledPostsWithMedia(30, 1000, 7 * 24 * H)
+      queries().forEach((q) => expect(q.indexedAt.$gt).toBe(NOW - 7 * 24 * H))
     })
 
     it('splits quota 2/3 fresh, 1/3 scheduled', async () => {

@@ -344,9 +344,11 @@ class dbSingleton {
   //        Labels can land arbitrarily late and feed filters (excludeNSFW /
   //        nsfwOnly) depend on them, so this continues until retention.
   //      * missed posts (absent from a successful getPosts response: deleted,
-  //        takedown): labels untouched; labelsMissCount=K, due on the same
-  //        delay schedule, and dropped for good at K >= LABEL_MAX_MISSES (5).
-  //        Found posts also stop once misses reach the cap.
+  //        takedown, deactivated account): labels untouched; labelsMissCount=K,
+  //        due on the same delay schedule (1h, 6h, 24h, then every 24h). There
+  //        is no miss cap: a reversible takedown can bring posts back with
+  //        labels, so rechecking only ends at the retention bound. Cost is
+  //        bounded by the 24h plateau and 25-URIs-per-call batching.
   // Starvation guard: of `limit`, ~2/3 is reserved for fresh posts and the
   // rest for scheduled ones; whichever class is short spills its unused quota
   // to the other. Index use: indexedAt index serves the range/sort; the
@@ -363,11 +365,9 @@ class dbSingleton {
     lagTime = 5 * 60 * 1000,
     retentionMs = (Number(process.env.LABEL_RECHECK_RETENTION_DAYS) || 56) *
       24 * 60 * 60 * 1000,
-    maxMisses = Number(process.env.LABEL_MAX_MISSES) || 5,
   ) {
     const now = new Date().getTime()
     const delays = dbSingleton.RECHECK_DELAYS
-    const delayFor = (n: number) => delays[Math.min(n, delays.length) - 1]
     const base = {
       $or: [
         { 'embed.images': { $ne: null } },
@@ -388,18 +388,19 @@ class dbSingleton {
         labelsCheckedAt: { $lt: now - delays[delays.length - 1] },
       },
     ]
-    const missDue: Filter<Document>[] = []
-    for (let k = 1; k < maxMisses; k++) {
-      missDue.push({
+    const missDue: Filter<Document>[] = [
+      ...delays.map((d, i) => ({
         labelsCheckCount: { $exists: false },
-        labelsMissCount: k,
-        labelsCheckedAt: { $lt: now - delayFor(k) },
-      })
-    }
-    const scheduled: Filter<Document> = {
-      labelsMissCount: { $not: { $gte: maxMisses } },
-      $or: [...foundDue, ...missDue],
-    }
+        labelsMissCount: i + 1,
+        labelsCheckedAt: { $lt: now - d },
+      })),
+      {
+        labelsCheckCount: { $exists: false },
+        labelsMissCount: { $gt: delays.length },
+        labelsCheckedAt: { $lt: now - delays[delays.length - 1] },
+      },
+    ]
+    const scheduled: Filter<Document> = { $or: [...foundDue, ...missDue] }
 
     const coll = this.client?.db().collection('post')
     const run = async (extra: Filter<Document>, n: number, skip = 0) => {
