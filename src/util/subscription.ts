@@ -12,6 +12,7 @@ import { Jetstream, CommitType } from '@skyware/jetstream'
 import WebSocket from 'ws'
 
 import { Semaphore } from 'async-mutex'
+import { EventQueue } from './eventQueue'
 
 const semaphore = new Semaphore(128)
 
@@ -27,7 +28,7 @@ export abstract class FirehoseSubscriptionBase {
   async run(subscriptionReconnectDelay: number) {
     let lastSuccessfulCursor = (await this.getCursor()).cursor
     console.log("Fetching jetstream with cursor:", lastSuccessfulCursor)
-    const eventQueue: any[] = []
+    const eventQueue = new EventQueue()
 
     this.jetstream = new Jetstream({
       wantedCollections: Array.from(includedRecords.values()),
