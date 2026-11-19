@@ -19,6 +19,8 @@ export type Post = {
   labels?: string[]
   // ms epoch when batchUpdate last fetched labels for this post (absent = never)
   labelsCheckedAt?: number
+  // number of successful label fetches (drives the re-check backoff)
+  labelsCheckCount?: number
 }
 
 export type SubState = {

@@ -36,11 +36,8 @@ export default async function batchUpdate(agent, interval) {
 
       const posts = res.data.posts
 
-      if (posts.length === 0) {
-        chunk.forEach((uri) => {
-          postEntries.push({ uri: uri, labels: [] })
-        })
-      }
+      // URIs missing from the response (or an empty response) are NOT
+      // recorded: they stay unchecked and keep their existing labels.
 
       for (let k = 0; k < posts.length; k++) {
         const labels: string[] = []

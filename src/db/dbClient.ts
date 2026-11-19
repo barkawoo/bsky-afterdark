@@ -334,15 +334,41 @@ class dbSingleton {
     else return results
   }
 
-  // Posts whose labels were checked (labelsCheckedAt) are skipped, except that
-  // a post is re-checked once if its last check happened before
-  // indexedAt + recheckAfter (moderation labels can land late). Posts without
-  // labelsCheckedAt (legacy docs) count as unchecked.
+  // Re-check schedule: after the Nth successful label fetch (labelsCheckCount=N)
+  // a post is due again once labelsCheckedAt is older than RECHECK_DELAYS[N-1]
+  // (the last delay repeats). Labels can land arbitrarily late and feed
+  // filters (excludeNSFW / nsfwOnly) depend on them, so we keep re-checking
+  // until the post is older than the longest feed retention (56 days for
+  // mutuals-ad-vid; env LABEL_RECHECK_RETENTION_DAYS). Posts lacking the
+  // fields (legacy docs, or never successfully fetched) count as unchecked.
+  // Index use: the planner can use the indexedAt index for the range; the
+  // count/checkedAt branches are residual filters over the candidates.
+  static readonly RECHECK_DELAYS = [
+    60 * 60 * 1000,
+    6 * 60 * 60 * 1000,
+    24 * 60 * 60 * 1000,
+  ]
+
   async getUnlabelledPostsWithMedia(
     limit = 100,
     lagTime = 5 * 60 * 1000,
-    recheckAfter = 60 * 60 * 1000,
+    retentionMs = (Number(process.env.LABEL_RECHECK_RETENTION_DAYS) || 56) *
+      24 * 60 * 60 * 1000,
   ) {
+    const now = new Date().getTime()
+    const delays = dbSingleton.RECHECK_DELAYS
+    const due: Filter<Document>[] = [
+      { labelsCheckCount: { $exists: false } },
+      { labelsCheckedAt: { $exists: false } },
+      ...delays.map((d, i) => ({
+        labelsCheckCount: i + 1,
+        labelsCheckedAt: { $lt: now - d },
+      })),
+      {
+        labelsCheckCount: { $gt: delays.length },
+        labelsCheckedAt: { $lt: now - delays[delays.length - 1] },
+      },
+    ]
     const results = this.client
       ?.db()
       .collection('post')
@@ -353,20 +379,8 @@ class dbSingleton {
           { 'embed.media': { $ne: null } },
         ],
         labels: [],
-        indexedAt: { $lt: new Date().getTime() - lagTime },
-        $and: [
-          {
-            $or: [
-              { labelsCheckedAt: { $exists: false } },
-              { labelsCheckedAt: null },
-              {
-                $expr: {
-                  $lt: ['$labelsCheckedAt', { $add: ['$indexedAt', recheckAfter] }],
-                },
-              },
-            ],
-          },
-        ],
+        indexedAt: { $lt: now - lagTime, $gt: now - retentionMs },
+        $and: [{ $or: due }],
       })
       .sort({ indexedAt: -1, cid: -1 })
       .limit(limit)
@@ -387,7 +401,10 @@ class dbSingleton {
           postEntries.map((e) => ({
             updateOne: {
               filter: { uri: { $eq: e.uri } },
-              update: { $set: { labels: e.labels, labelsCheckedAt: checkedAt } },
+              update: {
+                $set: { labels: e.labels, labelsCheckedAt: checkedAt },
+                $inc: { labelsCheckCount: 1 },
+              },
             },
           })),
           { ordered: false },
