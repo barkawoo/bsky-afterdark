@@ -100,39 +100,87 @@ describe('dbClient write characterization', () => {
     await expect(dbClient.replaceManyURI('post', [{ _id: 'a', uri: 'u' }])).rejects.toThrow('bulk')
   })
 
-  describe('getUnlabelledPostsWithMedia backoff', () => {
+  describe('getUnlabelledPostsWithMedia backoff and quotas', () => {
     const H = 3600 * 1000
     const NOW = 1_800_000_000_000
     beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(NOW) })
     afterEach(() => { vi.useRealTimers() })
+    const queries = () => collection.find.mock.calls.map((c) => c[0])
+    const isFresh = (q: any) => 'labelsCheckedAt' in q && !q.$or?.some?.((x: any) => x.labelsCheckCount)
+    const lim = () => cursor.limit.mock.calls.map((c: any) => c[0])
 
-    it('queries media posts with labels: [] inside lag/retention window', async () => {
-      cursor.toArray.mockResolvedValue([{ uri: 'a' }])
-      const res = await dbClient.getUnlabelledPostsWithMedia(300, 1000, 5000)
-      const q = collection.find.mock.calls[0][0]
+    it('base filter: media posts, labels [], lag/retention window', async () => {
+      await dbClient.getUnlabelledPostsWithMedia(30, 1000, 5000)
+      const q = queries()[0]
       expect(q.labels).toEqual([])
-      expect(q.$or).toHaveLength(3)
+      expect(q.$or).toBeDefined()
       expect(q.indexedAt).toEqual({ $lt: NOW - 1000, $gt: NOW - 5000 })
-      expect(cursor.limit).toHaveBeenCalledWith(300)
-      expect(res).toEqual([{ uri: 'a' }])
     })
 
     it('defaults retention to 56 days', async () => {
       await dbClient.getUnlabelledPostsWithMedia()
-      expect(collection.find.mock.calls[0][0].indexedAt.$gt).toBe(NOW - 56 * 24 * H)
+      expect(queries()[0].indexedAt.$gt).toBe(NOW - 56 * 24 * H)
     })
 
-    it('encodes the 1h/6h/24h/24h-repeat schedule with exact boundaries', async () => {
-      await dbClient.getUnlabelledPostsWithMedia(10, 1000, 1e15)
-      const due = collection.find.mock.calls[0][0].$and[0].$or
-      expect(due).toContainEqual({ labelsCheckCount: { $exists: false } })
-      expect(due).toContainEqual({ labelsCheckedAt: { $exists: false } })
-      expect(due).toContainEqual({ labelsCheckCount: 1, labelsCheckedAt: { $lt: NOW - 1 * H } })
-      expect(due).toContainEqual({ labelsCheckCount: 2, labelsCheckedAt: { $lt: NOW - 6 * H } })
-      expect(due).toContainEqual({ labelsCheckCount: 3, labelsCheckedAt: { $lt: NOW - 24 * H } })
-      expect(due).toContainEqual({ labelsCheckCount: { $gt: 3 }, labelsCheckedAt: { $lt: NOW - 24 * H } })
-      expect(due).toHaveLength(6)
+    it('fresh class = labelsCheckedAt absent', async () => {
+      await dbClient.getUnlabelledPostsWithMedia(30)
+      const fresh = queries().find((q) => q.labelsCheckedAt?.$exists === false)
+      expect(fresh).toBeDefined()
     })
+
+    it('found-post schedule 1h/6h/24h/24h-repeat with exact boundaries', async () => {
+      await dbClient.getUnlabelledPostsWithMedia(30, 1000, 1e15)
+      const sched = queries().find((q) => q.labelsMissCount)
+      const or = sched.$or
+      expect(or).toContainEqual({ labelsCheckCount: 1, labelsCheckedAt: { $lt: NOW - 1 * H } })
+      expect(or).toContainEqual({ labelsCheckCount: 2, labelsCheckedAt: { $lt: NOW - 6 * H } })
+      expect(or).toContainEqual({ labelsCheckCount: 3, labelsCheckedAt: { $lt: NOW - 24 * H } })
+      expect(or).toContainEqual({ labelsCheckCount: { $gt: 3 }, labelsCheckedAt: { $lt: NOW - 24 * H } })
+    })
+
+    it('miss schedule 1h/6h/24h/24h, capped at maxMisses (cap excluded)', async () => {
+      await dbClient.getUnlabelledPostsWithMedia(30, 1000, 1e15, 5)
+      const sched = queries().find((q) => q.labelsMissCount)
+      expect(sched.labelsMissCount).toEqual({ $not: { $gte: 5 } })
+      const miss = (k: number, d: number) => ({
+        labelsCheckCount: { $exists: false }, labelsMissCount: k, labelsCheckedAt: { $lt: NOW - d * H },
+      })
+      const or = sched.$or
+      expect(or).toContainEqual(miss(1, 1))
+      expect(or).toContainEqual(miss(2, 6))
+      expect(or).toContainEqual(miss(3, 24))
+      expect(or).toContainEqual(miss(4, 24))
+      expect(or.filter((x: any) => x.labelsMissCount !== undefined)).toHaveLength(4) // no k=5 branch
+    })
+
+    it('splits quota 2/3 fresh, 1/3 scheduled', async () => {
+      cursor.toArray.mockResolvedValueOnce(Array.from({ length: 10 }, (_, i) => ({ uri: 's' + i })))
+      await dbClient.getUnlabelledPostsWithMedia(30)
+      expect(lim()).toEqual([10, 20]) // scheduled first (quota), then fresh gets the rest
+    })
+
+    it('fresh spills unused scheduled quota', async () => {
+      cursor.toArray.mockResolvedValueOnce([{ uri: 's1' }]) // scheduled returns 1 of 10
+      await dbClient.getUnlabelledPostsWithMedia(30)
+      expect(lim()).toEqual([10, 29])
+    })
+
+    it('scheduled spills unused fresh quota (with skip)', async () => {
+      cursor.toArray
+        .mockResolvedValueOnce(Array.from({ length: 10 }, (_, i) => ({ uri: 's' + i })))
+        .mockResolvedValueOnce([{ uri: 'f1' }]) // fresh returns only 1 of 20
+      await dbClient.getUnlabelledPostsWithMedia(30)
+      expect(lim()).toEqual([10, 20, 19])
+      expect(cursor.skip).toHaveBeenCalledWith(10)
+    })
+  })
+
+  it('updateLabelsForURIs records misses without touching labels', async () => {
+    await dbClient.updateLabelsForURIs([{ uri: 'gone', missing: true }])
+    const u = collection.bulkWrite.mock.calls[0][0][0].updateOne
+    expect(u.update.$set).not.toHaveProperty('labels')
+    expect(typeof u.update.$set.labelsCheckedAt).toBe('number')
+    expect(u.update.$inc).toEqual({ labelsMissCount: 1 })
   })
 })
 
@@ -196,7 +244,7 @@ describe('batchUpdate characterization', () => {
     await expect(batchUpdate(agent, 1)).rejects.toBe(stop)
   }
 
-  it('chunks uris by 25 and records only returned posts (incl. empty labels)', async () => {
+  it('chunks uris by 25 and records found posts and marks absent ones as misses', async () => {
     const uris = Array.from({ length: 60 }, (_, i) => `at://p${i}`)
     const getPosts = vi.fn(async ({ uris }: any) => {
       const n = getPosts.mock.calls.length
@@ -208,11 +256,15 @@ describe('batchUpdate characterization', () => {
     expect(getPosts.mock.calls.map((c) => c[0].uris.length)).toEqual([25, 25, 10])
     const entries = mockDb.updateLabelsForURIs.mock.calls[0][0]
     // chunk 1: only p0 returned; chunk 2 empty response: nothing recorded; chunk 3: all 10
-    expect(entries[0]).toEqual({ uri: 'at://p0', labels: ['porn'] })
-    expect(entries).toHaveLength(1 + 10)
-    expect(entries.slice(1).every((e: any) => e.labels.length === 0)).toBe(true)
-    expect(entries.map((e: any) => e.uri)).not.toContain('at://p1')
-    expect(entries.map((e: any) => e.uri)).not.toContain('at://p25')
+    expect(entries.find((e: any) => e.uri === 'at://p0')).toEqual({ uri: 'at://p0', labels: ['porn'] })
+    const found = entries.filter((e: any) => !e.missing)
+    const missed = entries.filter((e: any) => e.missing)
+    // chunk 1: 24 absent -> misses; chunk 2 empty response: 25 misses; chunk 3: 10 found
+    expect(found).toHaveLength(1 + 10)
+    expect(missed).toHaveLength(24 + 25)
+    expect(missed.every((e: any) => e.labels === undefined)).toBe(true)
+    expect(missed.map((e: any) => e.uri)).toContain('at://p1')
+    expect(found.map((e: any) => e.uri)).not.toContain('at://p1')
   })
 
   it('awaits updateLabelsForURIs', async () => {
@@ -242,6 +294,10 @@ describe('batchUpdate characterization', () => {
       .mockRejectedValueOnce(new Error('net'))
       .mockResolvedValueOnce({ data: { posts: [{ uri: 'at://p25', labels: [] }] } })
     await run(uris, getPosts)
-    expect(mockDb.updateLabelsForURIs.mock.calls[0][0]).toEqual([{ uri: 'at://p25', labels: [] }])
+    // thrown fetch (chunk 1) is not a miss; chunk 2 found p25, p26-p29 absent
+    const e = mockDb.updateLabelsForURIs.mock.calls[0][0]
+    expect(e.map((x: any) => x.uri)).not.toContain('at://p0')
+    expect(e).toContainEqual({ uri: 'at://p25', labels: [] })
+    expect(e.filter((x: any) => x.missing).map((x: any) => x.uri)).toEqual(['at://p26', 'at://p27', 'at://p28', 'at://p29'])
   })
 })

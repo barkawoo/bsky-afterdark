@@ -19,8 +19,9 @@ export const resetCollection = () => {
   collection.replaceOne.mockResolvedValue({})
   collection.findOneAndUpdate.mockResolvedValue({})
   collection.bulkWrite.mockResolvedValue({})
-  const cursor = { sort: vi.fn(), limit: vi.fn(), toArray: vi.fn().mockResolvedValue([]) }
+  const cursor = { sort: vi.fn(), skip: vi.fn(), limit: vi.fn(), toArray: vi.fn().mockResolvedValue([]) }
   cursor.sort.mockReturnValue(cursor)
+  cursor.skip.mockReturnValue(cursor)
   cursor.limit.mockReturnValue(cursor)
   collection.find.mockReturnValue(cursor)
   return cursor
