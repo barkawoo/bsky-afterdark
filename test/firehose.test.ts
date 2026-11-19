@@ -59,12 +59,13 @@ let db: any
 let sub: TestSub
 let js: any
 
-const start = async (cursor = 500) => {
+const start = async (cursor = 500, maxQueue?: number) => {
   db = {
     getSubStateCursor: vi.fn().mockResolvedValue({ cursor }),
     updateSubStateCursor: vi.fn().mockResolvedValue(undefined),
   }
   sub = new TestSub(db, 'svc')
+  if (maxQueue) sub.maxQueue = maxQueue
   void sub.run(3000)
   await vi.advanceTimersByTimeAsync(10_001)
   js = instances[instances.length - 1]
@@ -150,6 +151,7 @@ describe('firehose consumer characterization', () => {
     await vi.advanceTimersByTimeAsync(50)
     js.ws.readyState = 3
     js.cursor = 999999 // library cursor ran ahead
+    js.emit('close')
     await vi.advanceTimersByTimeAsync(50)
     expect(js.startCalls).toBeGreaterThanOrEqual(2)
     expect(js.cursor).toBe(1007)
@@ -162,12 +164,76 @@ describe('firehose consumer characterization', () => {
     expect(js.startCalls).toBe(1)
   })
 
-  it('closes jetstream when queue exceeds 1,000,000 events', async () => {
-    await start()
+  it('closes jetstream when queue exceeds the cap', async () => {
+    await start(500, 100)
     const evt = commit(1)
-    for (let i = 0; i < 1_000_000; i++) js.emit('commit', evt)
+    for (let i = 0; i < 100; i++) js.emit('commit', evt)
     expect(js.closeCalls).toBe(0)
     js.emit('commit', evt)
     expect(js.closeCalls).toBe(1)
+  })
+
+  it('default cap is 50,000', async () => {
+    await start()
+    expect(sub.maxQueue).toBe(50_000)
+  })
+
+  it('overflow then drain resumes from last handled cursor without losing events', async () => {
+    await start(500, 20)
+    for (let i = 0; i < 21; i++) js.emit('commit', commit(i))
+    expect(js.closeCalls).toBe(1)
+    js.emit('close')
+    js.cursor = 999999 // library ran ahead of what we handled
+    await vi.advanceTimersByTimeAsync(100)
+    expect(sub.handled.map((p) => p.cursor)).toEqual(
+      Array.from({ length: 21 }, (_, i) => 1000 + i),
+    )
+    expect(js.startCalls).toBe(2)
+    expect(js.cursor).toBe(1020)
+  })
+
+  it('does not clear library cursor on resume when nothing handled yet', async () => {
+    await start(0)
+    js.ws.readyState = 3
+    js.cursor = 4242
+    js.emit('close')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(js.startCalls).toBe(2)
+    expect(js.cursor).toBe(4242)
+  })
+
+  it('idle consumer does not poll with setTimeout', async () => {
+    await start()
+    const spy = vi.spyOn(globalThis, 'setTimeout')
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(spy).not.toHaveBeenCalled()
+    js.emit('commit', commit(1))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(sub.handled.length).toBe(1)
+  })
+
+  it('uses configured jetstream endpoint', async () => {
+    db = { getSubStateCursor: vi.fn().mockResolvedValue({}), updateSubStateCursor: vi.fn() }
+    sub = new TestSub(db, 'svc')
+    expect(sub.jetstreamEndpoint).toBe('wss://jetstream2.us-west.bsky.network/subscribe')
+    sub.jetstreamEndpoint = 'wss://example.test/subscribe'
+    void sub.run(1)
+    await vi.advanceTimersByTimeAsync(10_001)
+    expect(instances[instances.length - 1].opts.endpoint).toBe('wss://example.test/subscribe')
+  })
+})
+
+describe('EventQueue', () => {
+  it('is FIFO across compaction and reports length', async () => {
+    const { EventQueue } = await import('../src/util/eventQueue')
+    const q = new EventQueue<number>()
+    for (let i = 0; i < 20000; i++) q.push(i)
+    expect(q.length).toBe(20000)
+    for (let i = 0; i < 15000; i++) expect(q.shift()).toBe(i)
+    q.push(20000)
+    expect(q.length).toBe(5001)
+    for (let i = 15000; i <= 20000; i++) expect(q.shift()).toBe(i)
+    expect(q.shift()).toBeUndefined()
+    expect(q.length).toBe(0)
   })
 })
