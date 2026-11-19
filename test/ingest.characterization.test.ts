@@ -46,37 +46,85 @@ describe('dbClient write characterization', () => {
     expect(data._id.id).toBeUndefined()
   })
 
-  it('updateLabelsForURIs issues one findOneAndUpdate per uri', async () => {
+  it('updateLabelsForURIs issues one awaited bulkWrite of updateOne ops, ordered:false', async () => {
     await dbClient.updateLabelsForURIs([
       { uri: 'a', labels: ['porn'] },
       { uri: 'b', labels: [] },
     ])
-    expect(collection.findOneAndUpdate.mock.calls).toEqual([
-      [{ uri: { $eq: 'a' } }, { $set: { labels: ['porn'] } }],
-      [{ uri: { $eq: 'b' } }, { $set: { labels: [] } }],
-    ])
+    expect(collection.findOneAndUpdate).not.toHaveBeenCalled()
+    expect(collection.bulkWrite).toHaveBeenCalledTimes(1)
+    const [ops, opts] = collection.bulkWrite.mock.calls[0]
+    expect(opts).toEqual({ ordered: false })
+    expect(ops).toHaveLength(2)
+    expect(ops[0].updateOne.filter).toEqual({ uri: { $eq: 'a' } })
+    expect(ops[0].updateOne.update.$set.labels).toEqual(['porn'])
+    expect(ops[1].updateOne.update.$set.labels).toEqual([])
+    // empty-label results are still marked checked
+    expect(typeof ops[1].updateOne.update.$set.labelsCheckedAt).toBe('number')
   })
 
-  it('getUnlabelledPostsWithMedia queries media posts with labels: [] older than lag', async () => {
+  it('updateLabelsForURIs skips bulkWrite for empty input', async () => {
+    await dbClient.updateLabelsForURIs([])
+    expect(collection.bulkWrite).not.toHaveBeenCalled()
+  })
+
+  it('updateLabelsForURIs logs instead of throwing when bulkWrite fails', async () => {
+    collection.bulkWrite.mockRejectedValue(new Error('boom'))
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await expect(dbClient.updateLabelsForURIs([{ uri: 'a', labels: [] }])).resolves.toBeUndefined()
+    expect(spy).toHaveBeenCalled()
+  })
+
+  it('replaceManyURI sends one ordered:false bulkWrite of _id-filtered upserts', async () => {
+    await dbClient.replaceManyURI('post', [
+      { _id: 'abc', uri: 'u1' },
+      { _id: 'def', uri: 'u2' },
+      { _id: null, uri: 'u3' },
+    ])
+    expect(collection.insertOne).not.toHaveBeenCalled()
+    expect(collection.bulkWrite).toHaveBeenCalledTimes(1)
+    const [ops, opts] = collection.bulkWrite.mock.calls[0]
+    expect(opts).toEqual({ ordered: false })
+    expect(ops[0].replaceOne.upsert).toBe(true)
+    expect(ops[0].replaceOne.filter._id.id).toBe('abc')
+    expect(ops[0].replaceOne.replacement._id.id).toBe('abc')
+    expect(ops[0].replaceOne.replacement.uri).toBe('u1')
+    expect(ops[2].insertOne.document._id.constructor.name).toBe('ObjectId')
+  })
+
+  it('replaceManyURI is a no-op for empty input and propagates errors', async () => {
+    await dbClient.replaceManyURI('post', [])
+    expect(collection.bulkWrite).not.toHaveBeenCalled()
+    collection.bulkWrite.mockRejectedValue(new Error('bulk'))
+    await expect(dbClient.replaceManyURI('post', [{ _id: 'a', uri: 'u' }])).rejects.toThrow('bulk')
+  })
+
+  it('getUnlabelledPostsWithMedia queries media posts with labels: [] older than lag, unchecked or due a recheck', async () => {
     cursor.toArray.mockResolvedValue([{ uri: 'a' }])
-    const res = await dbClient.getUnlabelledPostsWithMedia(300, 1000)
+    const res = await dbClient.getUnlabelledPostsWithMedia(300, 1000, 5000)
     const q = collection.find.mock.calls[0][0]
     expect(q.labels).toEqual([])
     expect(q.$or).toHaveLength(3)
     expect(q.indexedAt.$lt).toBeLessThanOrEqual(Date.now() - 1000 + 5)
+    const alts = q.$and[0].$or
+    expect(alts).toContainEqual({ labelsCheckedAt: { $exists: false } })
+    expect(alts).toContainEqual({ labelsCheckedAt: null })
+    expect(alts).toContainEqual({
+      $expr: { $lt: ['$labelsCheckedAt', { $add: ['$indexedAt', 5000] }] },
+    })
     expect(cursor.limit).toHaveBeenCalledWith(300)
     expect(res).toEqual([{ uri: 'a' }])
   })
 })
 
 describe('FirehoseSubscription.handleEvent characterization', () => {
-  it('builds docs with shake256 _id and dispatches delete + per-post replace', async () => {
+  it('builds docs with shake256 _id and dispatches delete + one batched replace', async () => {
     vi.resetModules()
     vi.doMock('../src/db/dbClient', () => ({ default: mockDb }))
     const { FirehoseSubscription } = await import('../src/subscription')
     const db: any = {
       deleteManyURI: vi.fn().mockResolvedValue(undefined),
-      replaceOneURI: vi.fn().mockResolvedValue(undefined),
+      replaceManyURI: vi.fn().mockResolvedValue(undefined),
     }
     const sub: any = Object.create(FirehoseSubscription.prototype)
     sub.db = db
@@ -92,25 +140,26 @@ describe('FirehoseSubscription.handleEvent characterization', () => {
     })
 
     expect(db.deleteManyURI).toHaveBeenCalledWith('post', ['at://del'])
-    expect(db.replaceOneURI).toHaveBeenCalledTimes(2)
-    const [coll, uri, doc] = db.replaceOneURI.mock.calls[0]
+    expect(db.replaceManyURI).toHaveBeenCalledTimes(1)
+    const [coll, docs] = db.replaceManyURI.mock.calls[0]
     expect(coll).toBe('post')
-    expect(uri).toBe('at://one')
+    expect(docs).toHaveLength(2)
+    const doc = docs[0]
     expect(doc._id).toBe(crypto.createHash('shake256', { outputLength: 12 }).update('at://one').digest('hex'))
     expect(doc).toMatchObject({ uri: 'at://one', cid: 'c1', author: 'did:a', text: 'hi', algoTags: ['tagA'], labels: [], tags: [], replyParent: null })
     expect(doc.earliestCreatedIndexedAt).toBe(Math.min(doc.createdAt, doc.indexedAt))
-    expect(db.replaceOneURI.mock.calls[1][2].labels).toEqual(['porn'])
+    expect(docs[1].labels).toEqual(['porn'])
   })
 
   it('does nothing for an empty event', async () => {
     const { FirehoseSubscription } = await import('../src/subscription')
-    const db: any = { deleteManyURI: vi.fn(), replaceOneURI: vi.fn() }
+    const db: any = { deleteManyURI: vi.fn(), replaceManyURI: vi.fn() }
     const sub: any = Object.create(FirehoseSubscription.prototype)
     sub.db = db
     sub.algoManagers = []
     await sub.handleEvent({ creates: [], deletes: [] })
     expect(db.deleteManyURI).not.toHaveBeenCalled()
-    expect(db.replaceOneURI).not.toHaveBeenCalled()
+    expect(db.replaceManyURI).not.toHaveBeenCalled()
   })
 })
 
@@ -143,6 +192,27 @@ describe('batchUpdate characterization', () => {
     expect(entries[0]).toEqual({ uri: 'at://p0', labels: ['porn'] })
     expect(entries.slice(1, 26).every((e: any) => e.labels.length === 0)).toBe(true)
     expect(entries).toHaveLength(1 + 25 + 10)
+  })
+
+  it('awaits updateLabelsForURIs', async () => {
+    vi.resetModules()
+    vi.doMock('../src/db/dbClient', () => ({ default: mockDb }))
+    vi.doMock('../src/addn/rateLimit', () => ({ default: (fn: any) => fn() }))
+    mockDb.getUnlabelledPostsWithMedia.mockResolvedValue([{ uri: 'a' }])
+    let finished = false
+    let calls = 0
+    mockDb.updateLabelsForURIs.mockImplementation(async () => {
+      if (++calls > 1) throw new Error('stop')
+      await new Promise((r) => setTimeout(r, 20))
+      finished = true
+    })
+    const getPosts = async () => ({ data: { posts: [] } })
+    const batchUpdate = (await import('../src/addn/batchUpdate')).default
+    const p = batchUpdate({ app: { bsky: { feed: { getPosts } } } }, 1).catch(() => {})
+    await new Promise((r) => setTimeout(r, 5))
+    expect(calls).toBe(1) // next loop iteration has not started before the update resolved
+    await p
+    expect(finished).toBe(true)
   })
 
   it('skips a chunk whose fetch fails', async () => {
