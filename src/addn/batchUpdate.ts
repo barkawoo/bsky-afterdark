@@ -52,6 +52,6 @@ export default async function batchUpdate(agent, interval) {
         postEntries.push({ uri: posts[k].uri, labels: labels })
       }
     }
-    dbClient.updateLabelsForURIs(postEntries)
+    await dbClient.updateLabelsForURIs(postEntries)
   }
 }

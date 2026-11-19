@@ -5,6 +5,7 @@ import { vi } from 'vitest'
 export const makeMockDbClient = () => ({
   getLatestPostsForTag: vi.fn().mockResolvedValue([]),
   replaceOneURI: vi.fn().mockResolvedValue(undefined),
+  replaceManyURI: vi.fn().mockResolvedValue(undefined),
   deleteManyURI: vi.fn().mockResolvedValue(undefined),
   updateLabelsForURIs: vi.fn().mockResolvedValue(undefined),
   getUnlabelledPostsWithMedia: vi.fn().mockResolvedValue([]),

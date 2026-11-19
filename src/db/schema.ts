@@ -16,6 +16,9 @@ export type Post = {
   algoTags: string[] | null
   embed?: any | null
   tags?: string[] | null
+  labels?: string[]
+  // ms epoch when batchUpdate last fetched labels for this post (absent = never)
+  labelsCheckedAt?: number
 }
 
 export type SubState = {

@@ -77,6 +77,40 @@ class dbSingleton {
     }
   }
 
+  /**
+   * Batched upsert of posts: one bulkWrite round trip instead of an
+   * insertOne (+ replaceOne on duplicate) per post.
+   *
+   * The filter is {_id}, NOT {uri}: _id is a deterministic hash of the uri
+   * (see subscription.ts), so the same post always maps to the same _id.
+   * Filtering on _id means an upsert can never try to insert an _id that
+   * already exists (which a {uri} filter could, if a legacy doc with that
+   * _id had a different uri/no uri). Behavior matches replaceOneURI: a
+   * post with a given _id is replaced in place; docs without a string _id
+   * get a fresh ObjectId and are plain inserts (as before).
+   * ordered:false so one bad doc doesn't block the rest; errors propagate.
+   */
+  async replaceManyURI(collection: string, docs: any[]) {
+    if (!docs || docs.length === 0) return
+    const ops = docs.map((data) => {
+      if (typeof data._id === typeof '') {
+        const _id = new ObjectId(data._id)
+        return {
+          replaceOne: {
+            filter: { _id },
+            replacement: { ...data, _id },
+            upsert: true,
+          },
+        }
+      }
+      return { insertOne: { document: { ...data, _id: new ObjectId() } } }
+    })
+    await this.client
+      ?.db()
+      .collection(collection)
+      .bulkWrite(ops as any, { ordered: false })
+  }
+
   async replaceOneDID(collection: string, did: string, data: any) {
     if (!(typeof data._id === typeof '')) data._id = new ObjectId()
     else {
@@ -300,7 +334,15 @@ class dbSingleton {
     else return results
   }
 
-  async getUnlabelledPostsWithMedia(limit = 100, lagTime = 5 * 60 * 1000) {
+  // Posts whose labels were checked (labelsCheckedAt) are skipped, except that
+  // a post is re-checked once if its last check happened before
+  // indexedAt + recheckAfter (moderation labels can land late). Posts without
+  // labelsCheckedAt (legacy docs) count as unchecked.
+  async getUnlabelledPostsWithMedia(
+    limit = 100,
+    lagTime = 5 * 60 * 1000,
+    recheckAfter = 60 * 60 * 1000,
+  ) {
     const results = this.client
       ?.db()
       .collection('post')
@@ -312,6 +354,19 @@ class dbSingleton {
         ],
         labels: [],
         indexedAt: { $lt: new Date().getTime() - lagTime },
+        $and: [
+          {
+            $or: [
+              { labelsCheckedAt: { $exists: false } },
+              { labelsCheckedAt: null },
+              {
+                $expr: {
+                  $lt: ['$labelsCheckedAt', { $add: ['$indexedAt', recheckAfter] }],
+                },
+              },
+            ],
+          },
+        ],
       })
       .sort({ indexedAt: -1, cid: -1 })
       .limit(limit)
@@ -321,14 +376,24 @@ class dbSingleton {
   }
 
   async updateLabelsForURIs(postEntries: { uri: string; labels: string[] }[]) {
-    for (let i = 0; i < postEntries.length; i++) {
-      this.client
+    // bulkWrite throws on an empty ops array
+    if (!postEntries || postEntries.length === 0) return
+    const checkedAt = new Date().getTime()
+    try {
+      await this.client
         ?.db()
         .collection('post')
-        .findOneAndUpdate(
-          { uri: { $eq: postEntries[i].uri } },
-          { $set: { labels: postEntries[i].labels } },
+        .bulkWrite(
+          postEntries.map((e) => ({
+            updateOne: {
+              filter: { uri: { $eq: e.uri } },
+              update: { $set: { labels: e.labels, labelsCheckedAt: checkedAt } },
+            },
+          })),
+          { ordered: false },
         )
+    } catch (err) {
+      console.error('core: updateLabelsForURIs bulkWrite failed', err)
     }
   }
 
